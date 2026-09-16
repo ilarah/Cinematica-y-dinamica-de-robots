@@ -26,6 +26,6 @@ python -m pip install roboticstoolbox-python swift-sim spatialmath-python spatia
 ```
 
 ### 3️. Extensiones Obligatorias para VS Code
-Si trabajas desde **Visual Studio Code**, es indispensable que instales las siguientes extensiones desde el Marketplace (`Ctrl + Shift + X`):
+Si trabajas desde **Visual Studio Code**, es indispensable que instales las siguientes extensiones desde el Marketplace de Extensiones (`Ctrl + Shift + X`):
 * **Python** (de Microsoft)
 * **Jupyter** (de Microsoft)
