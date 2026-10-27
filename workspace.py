@@ -58,6 +58,7 @@ def poligono(vertices, pasos=15, cerrar=True):
 
 def jtraj_vertices(qv, pasos=15):
     """jtraj entre q de vértices consecutivos. Misma longitud que la salida de poligono()."""
+    pasos = int(pasos)
     return np.vstack([rtb.jtraj(qv[i], qv[i+1], pasos).q[(0 if i == 0 else 1):]
                       for i in range(len(qv) - 1)])
 
@@ -112,7 +113,7 @@ def comparar_jtraj(robot, puntos, qs, valido, idx, P=None):
         print(f"Vértices no válidos: {list(malos)}. Ajusta la figura.")
         return None, None
 
-    pasos = idx[1] - idx[0] + 1                 # el mismo que usó poligono()
+    pasos = int(idx[1] - idx[0] + 1)                 # el mismo que usó poligono()
     qj = jtraj_vertices(qs[idx], pasos)
     Pj = robot.fkine(qj).t
     comparar(puntos, Pj, idx, P=P, qs=qs, qj=qj)
@@ -123,27 +124,135 @@ def comparar_jtraj(robot, puntos, qs, valido, idx, P=None):
 # 3. VALIDACIÓN DE LA CINEMÁTICA INVERSA
 # =====================================================================
 
-def validar_ik(robot, qs, objetivo, tol=1e-4):
-    """Revisa cada q de la IK: (a) llega al punto pedido, (b) respeta qlim.
-    Devuelve (qs normalizados, valido, colores)  verde = correcta, rojo = no."""
-    qs = np.atleast_2d(qs).copy()
-    objetivo = np.atleast_2d(objetivo)
-    rev = [l.isrevolute for l in robot.links]
-    qs[:, rev] = np.angle(np.exp(1j * qs[:, rev]))      # (-π, π] solo en revolutas
+def _ajustar_a_qlim(robot, qs):
+    """Lleva cada revoluta al equivalente q+2πk dentro de [lo, hi];
+    si no existe ninguno, la deja en (-π, π] (y será marcada como inválida)."""
+    qs = qs.copy()
+    lo, hi = robot.qlim
+    ks = 2 * np.pi * np.array([-1, 0, 1])
+    for j, l in enumerate(robot.links):
+        if not l.isrevolute:
+            continue
+        cand = qs[:, j][:, None] + ks                       # (n, 3)
+        ok = (cand >= lo[j] - 1e-9) & (cand <= hi[j] + 1e-9)
+        elegido = cand[np.arange(len(qs)), np.where(ok, np.abs(cand), np.inf).argmin(axis=1)]
+        envuelto = np.angle(np.exp(1j * qs[:, j]))
+        qs[:, j] = np.where(ok.any(axis=1), elegido, envuelto)
+    return qs
 
-    con_q = np.isfinite(qs).all(axis=1)                  # filas donde la IK dio algo
+
+def _evaluar(robot, qs, objetivo, tol):
+    """Devuelve (con_q, llega, dentro) para cada fila de qs."""
+    con_q = np.isfinite(qs).all(axis=1)
     llega = np.zeros(len(qs), dtype=bool)
-    if con_q.any():                                      # evita fkine sobre arreglo vacío
+    if con_q.any():
         llega[con_q] = np.linalg.norm(
             robot.fkine(qs[con_q]).t - objetivo[con_q], axis=1) < tol
-
     lo, hi = robot.qlim
     dentro = np.all((qs >= lo - 1e-9) & (qs <= hi + 1e-9), axis=1)   # NaN da False
+    return con_q, llega, dentro
 
+
+def _ik_analitica(robot, p, atras, s):
+    """IK analítica del antropomórfico 3 GDL (MDH) para una rama dada.
+    atras: q1 + 180°.  s = +1 / -1: signo de q3 (codo)."""
+    L1, L2, L3 = robot.links[0].d, robot.links[2].a, robot.tool.t[0]
+    x, y, z = p
+    q1 = np.arctan2(y, x) + (np.pi if atras else 0.0)
+    r = x*np.cos(q1) + y*np.sin(q1)
+    zz = z - L1
+    c3 = (r**2 + zz**2 - L2**2 - L3**2) / (2*L2*L3)
+    if abs(c3) > 1:
+        return np.full(3, np.nan)
+    q3 = s*np.arccos(c3)
+    q2 = np.arctan2(zz, r) - np.arctan2(L3*np.sin(q3), L2 + L3*np.cos(q3))
+    return _ajustar_a_qlim(robot, np.array([[q1, q2, q3]]))[0]
+
+
+def semilla(robot, puntos):
+    """q0 analítica para el primer punto, eligiendo la rama (adelante/atrás x codo)
+    que mantiene más puntos dentro de qlim. None si ninguna rama sirve."""
+    lo, hi = robot.qlim
+    mejor, mejor_n = None, 0
+    for atras in (False, True):
+        for s in (1, -1):
+            qs = np.array([_ik_analitica(robot, p, atras, s) for p in puntos])
+            ok = np.all((qs >= lo - 1e-9) & (qs <= hi + 1e-9), axis=1)   # NaN da False
+            if ok[0] and ok.sum() > mejor_n:
+                mejor, mejor_n = qs[0], ok.sum()
+    return mejor
+
+
+def validar_ik(robot, qs, objetivo, tol=1e-4, reparar=True, intentos=30,
+               seed=0, cerrar=True):
+    """Revisa cada q de la IK: (a) llega al punto pedido, (b) respeta qlim.
+    Si reparar=True y la trayectoria no salió completa:
+      1) la rehace entera desde una semilla analítica (misma rama en todo el recorrido),
+      2) reintenta los puntos que sigan fallando con semillas vecinas y aleatorias (seed).
+    cerrar=True: si el último punto coincide con el primero, fuerza qs[-1] = qs[0].
+    Devuelve (qs, valido, colores)."""
+    qs = _ajustar_a_qlim(robot, np.atleast_2d(qs))
+    objetivo = np.atleast_2d(objetivo)
+
+    con_q, llega, dentro = _evaluar(robot, qs, objetivo, tol)
     valido = llega & dentro
-    colores = np.where(valido, 'g', 'r')
+    n_inicial = valido.sum()
 
-    print(f"{valido.sum()} de {len(qs)} puntos correctos")
+    if reparar and not valido.all():
+        # --- 1) rehacer la trayectoria completa desde la semilla analítica ---
+        q0 = semilla(robot, objetivo)
+        if q0 is not None:
+            qn, q_prev = np.full_like(qs, np.nan), q0
+            for k, p in enumerate(objetivo):
+                sol = robot.ikine_LM(SE3(*p), mask=[1, 1, 1, 0, 0, 0],
+                                     q0=q_prev, joint_limits=True)
+                if sol.success:
+                    qn[k] = q_prev = sol.q
+            qn = _ajustar_a_qlim(robot, qn)
+            _, ll, de = _evaluar(robot, qn, objetivo, tol)
+            if (ll & de).sum() > valido.sum():          # solo se acepta si mejora
+                qs, valido = qn, ll & de
+
+        # --- 2) reparar punto por punto lo que siga fallando ---
+        if not valido.all():
+            rng = np.random.default_rng(seed)
+            lo, hi = robot.qlim
+            mask = [1, 1, 1, 0, 0, 0]
+            for k in np.where(~valido)[0]:
+                vecinos = [qs[j] for j in (k - 1, k + 1)
+                           if 0 <= j < len(qs) and valido[j]]
+                semillas = vecinos + [rng.uniform(lo, hi) for _ in range(intentos)]
+                ref = vecinos[0] if vecinos else None
+                mejor, mejor_d = None, np.inf
+                for q0 in semillas:
+                    sol = robot.ikine_LM(SE3(*objetivo[k]), mask=mask,
+                                         q0=q0, joint_limits=True)
+                    if not sol.success:
+                        continue
+                    q = _ajustar_a_qlim(robot, sol.q[None, :])
+                    _, ll, de = _evaluar(robot, q, objetivo[k:k+1], tol)
+                    if ll[0] and de[0]:
+                        d = np.linalg.norm(q[0] - ref) if ref is not None else 0.0
+                        if d < mejor_d:             # la más cercana al vecino = continuidad
+                            mejor, mejor_d = q[0], d
+                        if ref is None:
+                            break
+                if mejor is not None:
+                    qs[k] = mejor
+                    valido[k] = True
+
+    con_q, llega, dentro = _evaluar(robot, qs, objetivo, tol)
+    valido = llega & dentro
+    reparados = valido.sum() - n_inicial
+
+    # figura cerrada en el espacio -> que cierre también en articulares
+    if cerrar and len(qs) > 1 and valido[0] and valido[-1] \
+            and np.allclose(objetivo[0], objetivo[-1]):
+        qs[-1] = qs[0]
+
+    colores = np.where(valido, 'g', 'r')
+    print(f"{valido.sum()} de {len(qs)} puntos correctos"
+          + (f" ({reparados} reparados)" if reparados > 0 else ""))
     for k in np.where(~valido)[0][:1]:
         motivo = ("sin solución de IK" if not con_q[k]
                   else "no llega al punto" if not llega[k] else "viola qlim")
